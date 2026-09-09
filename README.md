@@ -80,7 +80,6 @@ Requirements:
 - Node.js + npm
 - Rust stable 1.85 or newer
 - Xcode command line tools
-- ImageMagick for icon generation
 
 Install dependencies and start the desktop app:
 
@@ -98,7 +97,7 @@ npm install
 npm run package:mac
 ```
 
-The package script runs the frontend typecheck, Rust tests, icon generation, Tauri release build, app signature verification, DMG verification, zip packaging, and checksum generation.
+The package script runs the frontend typecheck, Rust tests, Tauri release build, app signature verification, DMG verification, zip packaging, and checksum generation.
 
 ## Versioning
 
@@ -119,8 +118,8 @@ Artifacts are written to `release/`:
 
 | Artifact | Purpose |
 | --- | --- |
-| `Codex Switch_<version>_<arch>.dmg` | macOS installer image when DMG bundling succeeds. |
-| `Codex Switch-<version>-macos-<arch>.zip` | Zipped `.app` bundle fallback and GitHub release attachment. |
+| `codex-switch-<version>-macos-<arch>.dmg` | macOS installer image when DMG bundling succeeds. |
+| `codex-switch-<version>-macos-<arch>.zip` | Zipped `.app` bundle fallback and GitHub release attachment. |
 | `SHA256SUMS.txt` | SHA-256 checksums for release files. |
 
 Current release builds use ad-hoc signing. They are suitable for local testing and source releases, but not notarized public binary distribution.
@@ -132,7 +131,7 @@ Current release builds use ad-hoc signing. They are suitable for local testing a
 | `frontend/` | React UI and Vite config. |
 | `src-tauri/` | Tauri desktop shell, tray menu, config takeover, session scanner, and app commands. |
 | `src/` | Local proxy proof-of-concept library and tests. |
-| `assets/icon.svg` | Source app icon used by the package script. |
+| `assets/icon.svg` | Source app icon. Regenerate Tauri icons only after changing it. |
 | `scripts/package-mac.sh` | macOS release packaging script. |
 | `docs/` | Planning and implementation notes. |
 

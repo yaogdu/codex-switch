@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 APP_NAME="Codex Switch"
+PACKAGE_NAME="codex-switch"
 VERSION="$(node -p "require('./package.json').version")"
 TAURI_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
 ROOT_CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
@@ -14,14 +15,9 @@ ARCH="${HOST%%-*}"
 OUT_DIR="$ROOT/release"
 APP_PATH="$ROOT/src-tauri/target/release/bundle/macos/$APP_NAME.app"
 DMG_PATH="$ROOT/src-tauri/target/release/bundle/dmg/${APP_NAME}_${VERSION}_${ARCH}.dmg"
-DMG_OUT_PATH="$OUT_DIR/$(basename "$DMG_PATH")"
-ZIP_PATH="$OUT_DIR/${APP_NAME}-${VERSION}-macos-${ARCH}.zip"
+DMG_OUT_PATH="$OUT_DIR/${PACKAGE_NAME}-${VERSION}-macos-${ARCH}.dmg"
+ZIP_PATH="$OUT_DIR/${PACKAGE_NAME}-${VERSION}-macos-${ARCH}.zip"
 SUMS_PATH="$OUT_DIR/SHA256SUMS.txt"
-
-command -v magick >/dev/null || {
-  echo "error: ImageMagick is required: brew install imagemagick" >&2
-  exit 1
-}
 
 if [[ "$VERSION" != "$TAURI_VERSION" || "$VERSION" != "$ROOT_CARGO_VERSION" || "$VERSION" != "$APP_CARGO_VERSION" ]]; then
   echo "error: version mismatch: package=$VERSION tauri=$TAURI_VERSION root-cargo=$ROOT_CARGO_VERSION app-cargo=$APP_CARGO_VERSION" >&2
@@ -29,11 +25,7 @@ if [[ "$VERSION" != "$TAURI_VERSION" || "$VERSION" != "$ROOT_CARGO_VERSION" || "
 fi
 
 mkdir -p "$OUT_DIR"
-rm -f "$DMG_OUT_PATH" "$ZIP_PATH" "$SUMS_PATH"
-
-echo "==> icons"
-magick -background none assets/icon.svg -resize 1024x1024 src-tauri/icons/icon.png
-npm run tauri -- icon src-tauri/icons/icon.png
+rm -f "$OUT_DIR"/*.dmg "$OUT_DIR"/*.zip "$SUMS_PATH"
 
 echo "==> checks"
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
