@@ -1,0 +1,37 @@
+{
+  "listen": "127.0.0.1:8787",
+  "default_profile": "sakura",
+  "profiles": {
+    "aihezu": {
+      "base_url": "https://example-aihezu.invalid",
+      "headers": {
+        "x-poc-upstream": "aihezu"
+      }
+    },
+    "her": {
+      "base_url": "https://example-her.invalid",
+      "headers": {
+        "x-poc-upstream": "her"
+      }
+    },
+    "sakura": {
+      "base_url": "https://example-sakura.invalid",
+      "headers": {
+        "x-poc-upstream": "sakura"
+      }
+    }
+  },
+  "bindings": {
+    "session-a": {
+      "mode": "fixed",
+      "profile": "aihezu"
+    },
+    "session-b": {
+      "mode": "fixed",
+      "profile": "her"
+    },
+    "session-c": {
+      "mode": "global"
+    }
+  }
+}

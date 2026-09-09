@@ -1,0 +1,38 @@
+{
+  "name": "codex-switch",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yaogdu/codex-switch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yaogdu/codex-switch/issues"
+  },
+  "homepage": "https://github.com/yaogdu/codex-switch#readme",
+  "scripts": {
+    "dev": "tauri dev",
+    "dev:renderer": "vite --config frontend/vite.config.ts",
+    "build": "tauri build",
+    "build:renderer": "vite build --config frontend/vite.config.ts",
+    "package:mac": "scripts/package-mac.sh",
+    "typecheck": "tsc --noEmit",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "lucide-react": "^0.542.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.2",
+    "vite": "^7.1.5"
+  }
+}

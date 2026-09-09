@@ -1,0 +1,632 @@
+use axum::{
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, State},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
+    response::{IntoResponse, Response},
+    routing::get,
+    Router,
+};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{collections::BTreeMap, net::SocketAddr, path::Path, sync::Arc};
+use tokio::sync::RwLock;
+
+const HOP_BY_HOP_HEADERS: [&str; 6] = [
+    "connection",
+    "content-length",
+    "host",
+    "keep-alive",
+    "proxy-authenticate",
+    "transfer-encoding",
+];
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Config {
+    pub listen: String,
+    pub default_profile: String,
+    pub profiles: BTreeMap<String, Profile>,
+    #[serde(default)]
+    pub bindings: BTreeMap<String, Binding>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Profile {
+    pub base_url: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Binding {
+    pub mode: BindingMode,
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BindingMode {
+    Global,
+    Fixed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyState {
+    config: Arc<RwLock<Config>>,
+    client: Client,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteDecision {
+    pub session_id: Option<String>,
+    pub session_id_source: SessionIdSource,
+    pub profile_id: String,
+    pub upstream: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionIdSource {
+    Header,
+    TurnMetadataThreadId,
+    MetadataSessionId,
+    BodySessionId,
+    None,
+}
+
+#[derive(Debug, Serialize)]
+struct RouteLog<'a> {
+    method: &'a str,
+    path: &'a str,
+    session_id: Option<&'a str>,
+    session_id_source: SessionIdSource,
+    profile_id: &'a str,
+    upstream: &'a str,
+    status: u16,
+}
+
+impl Config {
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("read config {}: {error}", path.display()))?;
+        let config = serde_json::from_str::<Self>(&text)
+            .map_err(|error| format!("parse config {}: {error}", path.display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.listen.trim().is_empty() {
+            return Err("listen must not be empty".to_string());
+        }
+        if !self.profiles.contains_key(&self.default_profile) {
+            return Err(format!(
+                "default profile {:?} is not configured",
+                self.default_profile
+            ));
+        }
+
+        for (profile_id, profile) in &self.profiles {
+            let url = profile.base_url.trim_end_matches('/');
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|error| format!("profile {profile_id:?} has invalid base_url: {error}"))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(format!(
+                    "profile {profile_id:?} base_url must use http or https"
+                ));
+            }
+            for header_name in profile.headers.keys() {
+                HeaderName::from_bytes(header_name.as_bytes()).map_err(|error| {
+                    format!("profile {profile_id:?} has invalid header {header_name:?}: {error}")
+                })?;
+            }
+            for (header_name, header_value) in &profile.headers {
+                HeaderValue::from_str(header_value).map_err(|error| {
+                    format!(
+                        "profile {profile_id:?} has invalid value for header {header_name:?}: {error}"
+                    )
+                })?;
+            }
+        }
+
+        for (session_id, binding) in &self.bindings {
+            if binding.mode == BindingMode::Fixed {
+                let Some(profile_id) = binding.profile.as_deref() else {
+                    return Err(format!(
+                        "fixed binding for session {session_id:?} requires a profile"
+                    ));
+                };
+                if !self.profiles.contains_key(profile_id) {
+                    return Err(format!(
+                        "binding for session {session_id:?} references unknown profile {profile_id:?}"
+                    ));
+                }
+            }
+        }
+
+        self.listen
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("listen must be a socket address: {error}"))?;
+        Ok(())
+    }
+}
+
+impl ProxyState {
+    pub fn new(config: Config) -> Result<Self, String> {
+        config.validate()?;
+        let client = Client::builder()
+            .build()
+            .map_err(|error| format!("build HTTP client: {error}"))?;
+        Ok(Self {
+            config: Arc::new(RwLock::new(config)),
+            client,
+        })
+    }
+
+    pub async fn replace_config(&self, config: Config) -> Result<(), String> {
+        config.validate()?;
+        *self.config.write().await = config;
+        Ok(())
+    }
+
+    async fn route_for(
+        &self,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<(RouteDecision, Profile), String> {
+        let config = self.config.read().await;
+        let (session_id, session_id_source) = extract_session_id(headers, body);
+        let profile_id = match session_id.as_deref() {
+            Some(session_id) => match config.bindings.get(session_id) {
+                Some(binding) if binding.mode == BindingMode::Fixed => binding
+                    .profile
+                    .clone()
+                    .ok_or_else(|| format!("fixed binding for {session_id:?} has no profile"))?,
+                _ => config.default_profile.clone(),
+            },
+            None => config.default_profile.clone(),
+        };
+        let profile = config
+            .profiles
+            .get(&profile_id)
+            .ok_or_else(|| format!("profile {profile_id:?} is not configured"))?;
+
+        Ok((
+            RouteDecision {
+                session_id,
+                session_id_source,
+                profile_id,
+                upstream: profile.base_url.trim_end_matches('/').to_string(),
+            },
+            profile.clone(),
+        ))
+    }
+}
+
+pub fn app(state: ProxyState) -> Router {
+    Router::new()
+        .route("/healthz", get(health))
+        .fallback(proxy)
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .with_state(state)
+}
+
+async fn health() -> &'static str {
+    "ok"
+}
+
+async fn proxy(
+    State(state): State<ProxyState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (route, profile) = match state.route_for(&headers, &body).await {
+        Ok(route) => route,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or(uri.path());
+    let upstream_url = format!("{}{}", route.upstream, path_and_query);
+    let request_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(method) => method,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported HTTP method: {error}"),
+            )
+        }
+    };
+
+    let mut upstream_headers = headers;
+    for header_name in HOP_BY_HOP_HEADERS {
+        upstream_headers.remove(header_name);
+    }
+    for header_name in [
+        "authorization",
+        "x-api-key",
+        "chatgpt-account-id",
+        "openai-organization",
+    ] {
+        upstream_headers.remove(header_name);
+    }
+    for (header_name, header_value) in &profile.headers {
+        let name = match HeaderName::from_bytes(header_name.as_bytes()) {
+            Ok(name) => name,
+            Err(error) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("invalid configured header {header_name:?}: {error}"),
+                )
+            }
+        };
+        let value = match HeaderValue::from_str(header_value) {
+            Ok(value) => value,
+            Err(error) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("invalid configured header value {header_name:?}: {error}"),
+                )
+            }
+        };
+        upstream_headers.insert(name, value);
+    }
+
+    let upstream_response = state
+        .client
+        .request(request_method, &upstream_url)
+        .headers(upstream_headers)
+        .body(body)
+        .send()
+        .await;
+
+    let upstream_response = match upstream_response {
+        Ok(response) => response,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("upstream request failed: {error}"),
+            )
+        }
+    };
+
+    let status = upstream_response.status();
+    let response_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = Response::builder().status(response_status);
+    let response_headers = response.headers_mut().expect("response builder is valid");
+    for (header_name, header_value) in upstream_response.headers() {
+        if HOP_BY_HOP_HEADERS
+            .iter()
+            .any(|hop_header| header_name.as_str().eq_ignore_ascii_case(hop_header))
+        {
+            continue;
+        }
+        response_headers.append(header_name.clone(), header_value.clone());
+    }
+    let response = response
+        .body(Body::from_stream(upstream_response.bytes_stream()))
+        .expect("response body should be constructible");
+
+    let log = RouteLog {
+        method: method.as_str(),
+        path: path_and_query,
+        session_id: route.session_id.as_deref(),
+        session_id_source: route.session_id_source,
+        profile_id: &route.profile_id,
+        upstream: &route.upstream,
+        status: status.as_u16(),
+    };
+    if let Ok(line) = serde_json::to_string(&log) {
+        println!("{line}");
+    }
+    response
+}
+
+fn error_response(status: StatusCode, message: String) -> Response {
+    (
+        status,
+        axum::Json(serde_json::json!({
+            "error": message
+        })),
+    )
+        .into_response()
+}
+
+pub fn extract_session_id(headers: &HeaderMap, body: &[u8]) -> (Option<String>, SessionIdSource) {
+    for header_name in ["session_id", "x-session-id"] {
+        if let Some(value) = headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+        {
+            let value = value.trim();
+            if !value.is_empty() {
+                return (Some(value.to_string()), SessionIdSource::Header);
+            }
+        }
+    }
+
+    if let Some(thread_id) = headers
+        .get("x-codex-turn-metadata")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| {
+            let thread_id = value
+                .get("threadId")
+                .or_else(|| value.get("thread_id"))
+                .and_then(Value::as_str)?
+                .trim();
+            (!thread_id.is_empty()).then(|| thread_id.to_string())
+        })
+    {
+        return (Some(thread_id), SessionIdSource::TurnMetadataThreadId);
+    }
+
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return (None, SessionIdSource::None);
+    };
+    if let Some(session_id) = value
+        .get("metadata")
+        .and_then(|metadata| metadata.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+    {
+        return (
+            Some(session_id.to_string()),
+            SessionIdSource::MetadataSessionId,
+        );
+    }
+    if let Some(session_id) = value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+    {
+        return (Some(session_id.to_string()), SessionIdSource::BodySessionId);
+    }
+
+    (None, SessionIdSource::None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        response::IntoResponse,
+        routing::any,
+    };
+    use std::{collections::HashMap, future::Future};
+    use tokio::task::JoinHandle;
+
+    struct TestServer {
+        addr: SocketAddr,
+        task: JoinHandle<()>,
+    }
+
+    impl TestServer {
+        async fn start(router: Router) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let addr = listener.local_addr().expect("test server address");
+            let task = tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .await
+                    .expect("test server should run");
+            });
+            Self { addr, task }
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn upstream_handler(
+        State(profile): State<String>,
+        request: Request<Body>,
+    ) -> impl IntoResponse {
+        let session_id = request
+            .headers()
+            .get("session_id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("none");
+        (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "profile": profile,
+                "session_id": session_id,
+            })),
+        )
+    }
+
+    async fn start_upstream(profile: &str) -> TestServer {
+        TestServer::start(
+            Router::new()
+                .fallback(any(upstream_handler))
+                .with_state(profile.to_string()),
+        )
+        .await
+    }
+
+    fn test_config(upstreams: &HashMap<&str, TestServer>) -> Config {
+        let profiles = upstreams
+            .iter()
+            .map(|(profile, server)| {
+                (
+                    (*profile).to_string(),
+                    Profile {
+                        base_url: format!("http://{}", server.addr),
+                        headers: BTreeMap::from([(
+                            "x-poc-upstream".to_string(),
+                            (*profile).to_string(),
+                        )]),
+                    },
+                )
+            })
+            .collect();
+        Config {
+            listen: "127.0.0.1:0".to_string(),
+            default_profile: "sakura".to_string(),
+            profiles,
+            bindings: BTreeMap::from([
+                (
+                    "session-a".to_string(),
+                    Binding {
+                        mode: BindingMode::Fixed,
+                        profile: Some("aihezu".to_string()),
+                    },
+                ),
+                (
+                    "session-b".to_string(),
+                    Binding {
+                        mode: BindingMode::Fixed,
+                        profile: Some("her".to_string()),
+                    },
+                ),
+                (
+                    "session-c".to_string(),
+                    Binding {
+                        mode: BindingMode::Global,
+                        profile: None,
+                    },
+                ),
+            ]),
+        }
+    }
+
+    async fn collect<T>(futures: Vec<T>) -> Vec<T::Output>
+    where
+        T: Future,
+    {
+        futures::future::join_all(futures).await
+    }
+
+    #[test]
+    fn session_id_extraction_uses_declared_priority() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("from-header"));
+        let body = serde_json::json!({
+            "metadata": {"session_id": "from-metadata"},
+            "session_id": "from-body"
+        });
+        assert_eq!(
+            extract_session_id(&headers, body.to_string().as_bytes()),
+            (Some("from-header".to_string()), SessionIdSource::Header)
+        );
+
+        let body = serde_json::json!({"metadata": {"session_id": "from-metadata"}});
+        assert_eq!(
+            extract_session_id(&HeaderMap::new(), body.to_string().as_bytes()),
+            (
+                Some("from-metadata".to_string()),
+                SessionIdSource::MetadataSessionId
+            )
+        );
+    }
+
+    #[test]
+    fn session_id_extraction_reads_codex_turn_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-codex-turn-metadata",
+            HeaderValue::from_static(r#"{"threadId":"from-codex","turnId":"turn-1"}"#),
+        );
+        assert_eq!(
+            extract_session_id(&headers, b"{}"),
+            (
+                Some("from-codex".to_string()),
+                SessionIdSource::TurnMetadataThreadId
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_routes_concurrent_sessions_to_their_profiles() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert("aihezu", start_upstream("aihezu").await);
+        upstreams.insert("her", start_upstream("her").await);
+        upstreams.insert("sakura", start_upstream("sakura").await);
+
+        let state = ProxyState::new(test_config(&upstreams)).expect("valid test config");
+        let proxy = TestServer::start(app(state)).await;
+        let client = reqwest::Client::new();
+        let proxy_url = format!("http://{}", proxy.addr);
+
+        let mut requests = Vec::new();
+        for _ in 0..10 {
+            for session_id in ["session-a", "session-b", "session-c"] {
+                let client = client.clone();
+                let url = format!("{proxy_url}/responses");
+                requests.push(async move {
+                    let response = client
+                        .post(url)
+                        .header("session_id", session_id)
+                        .json(&serde_json::json!({"input": "poc"}))
+                        .send()
+                        .await
+                        .expect("proxy request");
+                    assert_eq!(response.status(), StatusCode::OK);
+                    response
+                        .json::<Value>()
+                        .await
+                        .expect("upstream JSON response")
+                });
+            }
+        }
+
+        let responses = collect(requests).await;
+        let mut counts = BTreeMap::<String, usize>::new();
+        for response in responses {
+            *counts
+                .entry(response["profile"].as_str().unwrap().to_string())
+                .or_default() += 1;
+        }
+        assert_eq!(
+            counts,
+            BTreeMap::from([
+                ("aihezu".to_string(), 10),
+                ("her".to_string(), 10),
+                ("sakura".to_string(), 10),
+            ])
+        );
+
+        let response = client
+            .post(format!("{proxy_url}/v1/responses"))
+            .json(&serde_json::json!({
+                "metadata": {"session_id": "session-b"}
+            }))
+            .send()
+            .await
+            .expect("metadata session request");
+        assert_eq!(response.json::<Value>().await.unwrap()["profile"], "her");
+
+        let response = client
+            .post(format!("{proxy_url}/responses"))
+            .header(
+                "x-codex-turn-metadata",
+                r#"{"threadId":"session-b","turnId":"turn-1"}"#,
+            )
+            .json(&serde_json::json!({"input": "poc"}))
+            .send()
+            .await
+            .expect("Codex turn metadata request");
+        assert_eq!(response.json::<Value>().await.unwrap()["profile"], "her");
+
+        let response = client
+            .get(format!("{proxy_url}/models"))
+            .send()
+            .await
+            .expect("default profile request");
+        assert_eq!(response.json::<Value>().await.unwrap()["profile"], "sakura");
+    }
+}
