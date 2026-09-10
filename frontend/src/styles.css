@@ -376,6 +376,11 @@ select:focus-visible {
   gap: 8px;
 }
 
+.toolbar-controls {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .topbar-status {
   display: flex;
   align-items: center;
@@ -581,6 +586,10 @@ select:focus-visible {
 
 .select-box {
   width: 119px;
+}
+
+.filter-select {
+  width: 126px;
 }
 
 .select-box select {

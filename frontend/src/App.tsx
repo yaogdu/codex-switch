@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import {
   Activity,
   ArrowDownUp,
+  CalendarDays,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -36,6 +37,7 @@ type Page = "sessions" | "profiles";
 type BindingMode = "global" | "fixed";
 type RefreshMinutes = 0 | 1 | 2 | 3 | 5 | 10 | 15;
 type ThemeMode = "system" | "light" | "dark";
+type SessionFilter = "today" | "all";
 
 const refreshOptions: RefreshMinutes[] = [1, 2, 3, 5, 10, 15];
 
@@ -115,6 +117,7 @@ function App() {
   const [page, setPage] = useState<Page>("sessions");
   const [dashboard, setDashboard] = useState<Dashboard>(sampleDashboard);
   const [query, setQuery] = useState("");
+  const [sessionFilter, setSessionFilter] = useState<SessionFilter>("today");
   const [sort, setSort] = useState<
     "last_active_at" | "created_at" | "size_bytes"
   >(
@@ -235,6 +238,9 @@ function App() {
     const normalized = query.trim().toLowerCase();
     return [...dashboard.sessions]
       .filter((session) => {
+        if (sessionFilter === "today" && !isToday(session.last_active_at)) {
+          return false;
+        }
         if (!normalized) return true;
         return [session.id, session.title, session.project_dir]
           .join(" ")
@@ -242,7 +248,13 @@ function App() {
           .includes(normalized);
       })
       .sort((a, b) => sortSessions(a, b, sort));
-  }, [dashboard.sessions, query, sort]);
+  }, [dashboard.sessions, query, sessionFilter, sort]);
+  const todaySessionCount = useMemo(
+    () =>
+      dashboard.sessions.filter((session) => isToday(session.last_active_at))
+        .length,
+    [dashboard.sessions],
+  );
   const totalSessionPages = Math.max(
     1,
     Math.ceil(sortedSessions.length / pageSize),
@@ -254,7 +266,7 @@ function App() {
 
   useEffect(() => {
     setSessionPage(1);
-  }, [query, sort]);
+  }, [query, sessionFilter, sort]);
 
   useEffect(() => {
     if (sessionPage > totalSessionPages) {
@@ -555,9 +567,9 @@ function App() {
         <section className="content">
           <div className="metric-strip">
             <Metric
-              label="活跃 Sessions"
-              value={String(dashboard.sessions.length)}
-              detail="来自本机 Codex 记录"
+              label="今日活跃"
+              value={String(todaySessionCount)}
+              detail={`全部 ${dashboard.sessions.length} 条记录`}
               icon={<Activity size={17} />}
             />
             <Metric
@@ -597,6 +609,18 @@ function App() {
                       }}
                       placeholder="搜索 ID、标题或目录"
                     />
+                  </label>
+                  <label className="select-box filter-select">
+                    <CalendarDays size={14} />
+                    <select
+                      value={sessionFilter}
+                      onChange={(event) =>
+                        setSessionFilter(event.target.value as SessionFilter)
+                      }
+                    >
+                      <option value="today">今天活跃</option>
+                      <option value="all">全部 Session</option>
+                    </select>
                   </label>
                   <label className="select-box">
                     <ArrowDownUp size={14} />
@@ -676,7 +700,11 @@ function App() {
                   </tbody>
                 </table>
                 {sortedSessions.length === 0 && (
-                  <EmptySessions query={query} onRefresh={() => void refresh()} />
+                  <EmptySessions
+                    query={query}
+                    sessionFilter={sessionFilter}
+                    onRefresh={() => void refresh()}
+                  />
                 )}
               </div>
               {sortedSessions.length > 0 && (
@@ -1009,20 +1037,31 @@ function ProfileDialog({
 
 function EmptySessions({
   query,
+  sessionFilter,
   onRefresh,
 }: {
   query: string;
+  sessionFilter: SessionFilter;
   onRefresh: () => void;
 }) {
+  const isTodayFilter = sessionFilter === "today";
   return (
     <div className="empty-state">
       <div className="empty-icon">
         <LayoutList size={20} />
       </div>
-      <strong>{query ? "没有匹配的 Session" : "还没有扫描到 Session"}</strong>
+      <strong>
+        {query
+          ? "没有匹配的 Session"
+          : isTodayFilter
+            ? "今天还没有活跃 Session"
+            : "还没有扫描到 Session"}
+      </strong>
       <span>
         {query
           ? "换一个关键词试试。"
+          : isTodayFilter
+            ? "切到全部 Session 查看历史记录。"
           : "确认本机存在 ~/.codex/sessions 后重新扫描。"}
       </span>
       {!query && (
@@ -1098,6 +1137,17 @@ function formatDate(timestamp: number) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(timestamp));
+}
+
+function isToday(timestamp: number) {
+  if (!timestamp) return false;
+  const date = new Date(timestamp);
+  const now = new Date();
+  return (
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate()
+  );
 }
 
 export default App;
