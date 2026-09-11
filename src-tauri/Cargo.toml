@@ -1,6 +1,6 @@
 [package]
 name = "codex-switch-app"
-version = "0.1.1"
+version = "0.1.2"
 description = "Codex Switch desktop app"
 authors = ["Codex Switch"]
 edition = "2021"
