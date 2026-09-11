@@ -1,11 +1,12 @@
 use axum::{
-    body::{Body, Bytes},
-    extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
+    body::Body,
+    extract::State,
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
+use futures::TryStreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -57,33 +58,12 @@ pub struct ProxyState {
     client: Client,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouteDecision {
-    pub session_id: Option<String>,
-    pub session_id_source: SessionIdSource,
-    pub profile_id: String,
-    pub upstream: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionIdSource {
     Header,
     TurnMetadataThreadId,
-    MetadataSessionId,
-    BodySessionId,
     None,
-}
-
-#[derive(Debug, Serialize)]
-struct RouteLog<'a> {
-    method: &'a str,
-    path: &'a str,
-    session_id: Option<&'a str>,
-    session_id_source: SessionIdSource,
-    profile_id: &'a str,
-    upstream: &'a str,
-    status: u16,
 }
 
 impl Config {
@@ -171,13 +151,9 @@ impl ProxyState {
         Ok(())
     }
 
-    async fn route_for(
-        &self,
-        headers: &HeaderMap,
-        body: &[u8],
-    ) -> Result<(RouteDecision, Profile), String> {
+    async fn route_for(&self, headers: &HeaderMap) -> Result<(String, Profile), String> {
         let config = self.config.read().await;
-        let (session_id, session_id_source) = extract_session_id(headers, body);
+        let session_id = extract_session_id(headers).0;
         let profile_id = match session_id.as_deref() {
             Some(session_id) => match config.bindings.get(session_id) {
                 Some(binding) if binding.mode == BindingMode::Fixed => binding
@@ -194,12 +170,7 @@ impl ProxyState {
             .ok_or_else(|| format!("profile {profile_id:?} is not configured"))?;
 
         Ok((
-            RouteDecision {
-                session_id,
-                session_id_source,
-                profile_id,
-                upstream: profile.base_url.trim_end_matches('/').to_string(),
-            },
+            profile.base_url.trim_end_matches('/').to_string(),
             profile.clone(),
         ))
     }
@@ -209,7 +180,6 @@ pub fn app(state: ProxyState) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .fallback(proxy)
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -217,14 +187,12 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn proxy(
-    State(state): State<ProxyState>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let (route, profile) = match state.route_for(&headers, &body).await {
+async fn proxy(State(state): State<ProxyState>, request: axum::extract::Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let method = parts.method;
+    let uri = parts.uri;
+    let headers = parts.headers;
+    let (upstream, profile) = match state.route_for(&headers).await {
         Ok(route) => route,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
     };
@@ -232,7 +200,7 @@ async fn proxy(
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or(uri.path());
-    let upstream_url = format!("{}{}", route.upstream, path_and_query);
+    let upstream_url = format!("{upstream}{path_and_query}");
     let request_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(method) => method,
         Err(error) => {
@@ -281,7 +249,9 @@ async fn proxy(
         .client
         .request(request_method, &upstream_url)
         .headers(upstream_headers)
-        .body(body)
+        .body(reqwest::Body::wrap_stream(body.into_data_stream().map_err(
+            |error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()),
+        )))
         .send()
         .await;
 
@@ -311,19 +281,6 @@ async fn proxy(
     let response = response
         .body(Body::from_stream(upstream_response.bytes_stream()))
         .expect("response body should be constructible");
-
-    let log = RouteLog {
-        method: method.as_str(),
-        path: path_and_query,
-        session_id: route.session_id.as_deref(),
-        session_id_source: route.session_id_source,
-        profile_id: &route.profile_id,
-        upstream: &route.upstream,
-        status: status.as_u16(),
-    };
-    if let Ok(line) = serde_json::to_string(&log) {
-        println!("{line}");
-    }
     response
 }
 
@@ -337,7 +294,8 @@ fn error_response(status: StatusCode, message: String) -> Response {
         .into_response()
 }
 
-pub fn extract_session_id(headers: &HeaderMap, body: &[u8]) -> (Option<String>, SessionIdSource) {
+pub fn extract_session_id(headers: &HeaderMap) -> (Option<String>, SessionIdSource) {
+    // ponytail: route from headers only; parsing the body would buffer streaming Codex requests.
     for header_name in ["session_id", "x-session-id"] {
         if let Some(value) = headers
             .get(header_name)
@@ -366,30 +324,6 @@ pub fn extract_session_id(headers: &HeaderMap, body: &[u8]) -> (Option<String>, 
         return (Some(thread_id), SessionIdSource::TurnMetadataThreadId);
     }
 
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
-        return (None, SessionIdSource::None);
-    };
-    if let Some(session_id) = value
-        .get("metadata")
-        .and_then(|metadata| metadata.get("session_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|session_id| !session_id.is_empty())
-    {
-        return (
-            Some(session_id.to_string()),
-            SessionIdSource::MetadataSessionId,
-        );
-    }
-    if let Some(session_id) = value
-        .get("session_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|session_id| !session_id.is_empty())
-    {
-        return (Some(session_id.to_string()), SessionIdSource::BodySessionId);
-    }
-
     (None, SessionIdSource::None)
 }
 
@@ -402,8 +336,13 @@ mod tests {
         response::IntoResponse,
         routing::any,
     };
-    use std::{collections::HashMap, future::Future};
-    use tokio::task::JoinHandle;
+    use futures::StreamExt;
+    use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+    use tokio::{
+        sync::{oneshot, Notify},
+        task::JoinHandle,
+        time::timeout,
+    };
 
     struct TestServer {
         addr: SocketAddr,
@@ -514,22 +453,23 @@ mod tests {
     #[test]
     fn session_id_extraction_uses_declared_priority() {
         let mut headers = HeaderMap::new();
+        headers.insert("session_id", HeaderValue::from_static("from-session"));
         headers.insert("x-session-id", HeaderValue::from_static("from-header"));
-        let body = serde_json::json!({
-            "metadata": {"session_id": "from-metadata"},
-            "session_id": "from-body"
-        });
         assert_eq!(
-            extract_session_id(&headers, body.to_string().as_bytes()),
-            (Some("from-header".to_string()), SessionIdSource::Header)
+            extract_session_id(&headers),
+            (Some("from-session".to_string()), SessionIdSource::Header)
         );
 
-        let body = serde_json::json!({"metadata": {"session_id": "from-metadata"}});
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-codex-turn-metadata",
+            HeaderValue::from_static(r#"{"threadId":"from-metadata"}"#),
+        );
         assert_eq!(
-            extract_session_id(&HeaderMap::new(), body.to_string().as_bytes()),
+            extract_session_id(&headers),
             (
                 Some("from-metadata".to_string()),
-                SessionIdSource::MetadataSessionId
+                SessionIdSource::TurnMetadataThreadId
             )
         );
     }
@@ -542,7 +482,7 @@ mod tests {
             HeaderValue::from_static(r#"{"threadId":"from-codex","turnId":"turn-1"}"#),
         );
         assert_eq!(
-            extract_session_id(&headers, b"{}"),
+            extract_session_id(&headers),
             (
                 Some("from-codex".to_string()),
                 SessionIdSource::TurnMetadataThreadId
@@ -602,8 +542,12 @@ mod tests {
 
         let response = client
             .post(format!("{proxy_url}/v1/responses"))
+            .header(
+                "x-codex-turn-metadata",
+                r#"{"threadId":"session-b","turnId":"turn-1"}"#,
+            )
             .json(&serde_json::json!({
-                "metadata": {"session_id": "session-b"}
+                "input": "poc"
             }))
             .send()
             .await
@@ -628,5 +572,71 @@ mod tests {
             .await
             .expect("default profile request");
         assert_eq!(response.json::<Value>().await.unwrap()["profile"], "sakura");
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_request_body_before_the_body_ends() {
+        let first_chunk_received = Arc::new(Notify::new());
+        let upstream_signal = first_chunk_received.clone();
+        let streaming_upstream =
+            TestServer::start(Router::new().fallback(any(move |body: Body| {
+                let upstream_signal = upstream_signal.clone();
+                async move {
+                    if body
+                        .into_data_stream()
+                        .next()
+                        .await
+                        .is_some_and(|chunk| chunk.is_ok())
+                    {
+                        upstream_signal.notify_one();
+                    }
+                    StatusCode::OK
+                }
+            })))
+            .await;
+
+        let mut upstreams = HashMap::new();
+        upstreams.insert("aihezu", streaming_upstream);
+        upstreams.insert("her", start_upstream("her").await);
+        upstreams.insert("sakura", start_upstream("sakura").await);
+        let state = ProxyState::new(test_config(&upstreams)).expect("valid test config");
+        let proxy = TestServer::start(app(state)).await;
+        let client = reqwest::Client::new();
+        let proxy_url = format!("http://{}", proxy.addr);
+
+        let (release_tx, release_rx) = oneshot::channel();
+        let mut release_rx = Some(release_rx);
+        let body = futures::stream::unfold(0, move |step| {
+            let gate = if step == 1 { release_rx.take() } else { None };
+            async move {
+                match step {
+                    0 => Some((Ok::<_, std::io::Error>(b"first".as_slice()), 1)),
+                    1 => {
+                        gate.expect("release gate").await.ok();
+                        Some((Ok(b"second".as_slice()), 2))
+                    }
+                    _ => None,
+                }
+            }
+        });
+
+        let request = tokio::spawn(
+            client
+                .post(format!("{proxy_url}/responses"))
+                .header("session_id", "session-a")
+                .body(reqwest::Body::wrap_stream(body))
+                .send(),
+        );
+
+        timeout(Duration::from_millis(250), first_chunk_received.notified())
+            .await
+            .expect("proxy buffered the request body before forwarding it");
+        release_tx.send(()).expect("release request body");
+
+        let response = request
+            .await
+            .expect("proxy request task")
+            .expect("proxy request");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
