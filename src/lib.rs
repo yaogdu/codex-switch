@@ -22,6 +22,13 @@ const HOP_BY_HOP_HEADERS: [&str; 6] = [
     "transfer-encoding",
 ];
 
+const PROFILE_AUTH_HEADERS: [&str; 4] = [
+    "authorization",
+    "x-api-key",
+    "chatgpt-account-id",
+    "openai-organization",
+];
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub listen: String,
@@ -176,6 +183,15 @@ impl ProxyState {
     }
 }
 
+fn profile_uses_client_auth(profile: &Profile) -> bool {
+    // ponytail: ChatGPT OAuth tokens are short-lived; Codex owns refresh, so use its request headers.
+    profile.base_url.contains("chatgpt.com/backend-api/codex")
+        || profile
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("chatgpt-account-id"))
+}
+
 pub fn app(state: ProxyState) -> Router {
     Router::new()
         .route("/healthz", get(health))
@@ -215,13 +231,11 @@ async fn proxy(State(state): State<ProxyState>, request: axum::extract::Request)
     for header_name in HOP_BY_HOP_HEADERS {
         upstream_headers.remove(header_name);
     }
-    for header_name in [
-        "authorization",
-        "x-api-key",
-        "chatgpt-account-id",
-        "openai-organization",
-    ] {
-        upstream_headers.remove(header_name);
+    let uses_client_auth = profile_uses_client_auth(&profile);
+    if !uses_client_auth {
+        for header_name in PROFILE_AUTH_HEADERS {
+            upstream_headers.remove(header_name);
+        }
     }
     for (header_name, header_value) in &profile.headers {
         let name = match HeaderName::from_bytes(header_name.as_bytes()) {
@@ -233,6 +247,13 @@ async fn proxy(State(state): State<ProxyState>, request: axum::extract::Request)
                 )
             }
         };
+        if uses_client_auth
+            && PROFILE_AUTH_HEADERS
+                .iter()
+                .any(|auth_header| name.as_str().eq_ignore_ascii_case(auth_header))
+        {
+            continue;
+        }
         let value = match HeaderValue::from_str(header_value) {
             Ok(value) => value,
             Err(error) => {
@@ -384,6 +405,26 @@ mod tests {
             axum::Json(serde_json::json!({
                 "profile": profile,
                 "session_id": session_id,
+            })),
+        )
+    }
+
+    async fn auth_echo_handler(request: Request<Body>) -> impl IntoResponse {
+        let authorization = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("missing");
+        let account_id = request
+            .headers()
+            .get("chatgpt-account-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("missing");
+        (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "authorization": authorization,
+                "account_id": account_id,
             })),
         )
     }
@@ -572,6 +613,78 @@ mod tests {
             .await
             .expect("default profile request");
         assert_eq!(response.json::<Value>().await.unwrap()["profile"], "sakura");
+    }
+
+    #[tokio::test]
+    async fn proxy_uses_client_auth_for_chatgpt_profiles() {
+        let upstream = TestServer::start(Router::new().fallback(any(auth_echo_handler))).await;
+        let config = Config {
+            listen: "127.0.0.1:0".to_string(),
+            default_profile: "personal".to_string(),
+            profiles: BTreeMap::from([(
+                "personal".to_string(),
+                Profile {
+                    base_url: format!("http://{}", upstream.addr),
+                    headers: BTreeMap::from([
+                        (
+                            "authorization".to_string(),
+                            "Bearer expired-profile-token".to_string(),
+                        ),
+                        (
+                            "chatgpt-account-id".to_string(),
+                            "expired-profile-account".to_string(),
+                        ),
+                    ]),
+                },
+            )]),
+            bindings: BTreeMap::new(),
+        };
+        let state = ProxyState::new(config).expect("valid test config");
+        let proxy = TestServer::start(app(state)).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/responses", proxy.addr))
+            .header("authorization", "Bearer current-client-token")
+            .header("chatgpt-account-id", "current-client-account")
+            .send()
+            .await
+            .expect("proxy request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.json::<Value>().await.expect("auth echo response");
+        assert_eq!(body["authorization"], "Bearer current-client-token");
+        assert_eq!(body["account_id"], "current-client-account");
+    }
+
+    #[tokio::test]
+    async fn proxy_uses_profile_auth_for_api_key_profiles() {
+        let upstream = TestServer::start(Router::new().fallback(any(auth_echo_handler))).await;
+        let config = Config {
+            listen: "127.0.0.1:0".to_string(),
+            default_profile: "sakura".to_string(),
+            profiles: BTreeMap::from([(
+                "sakura".to_string(),
+                Profile {
+                    base_url: format!("http://{}", upstream.addr),
+                    headers: BTreeMap::from([(
+                        "authorization".to_string(),
+                        "Bearer profile-api-key".to_string(),
+                    )]),
+                },
+            )]),
+            bindings: BTreeMap::new(),
+        };
+        let state = ProxyState::new(config).expect("valid test config");
+        let proxy = TestServer::start(app(state)).await;
+        let response = reqwest::Client::new()
+            .get(format!("http://{}/models", proxy.addr))
+            .header("authorization", "Bearer current-client-token")
+            .header("chatgpt-account-id", "current-client-account")
+            .send()
+            .await
+            .expect("proxy request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.json::<Value>().await.expect("auth echo response");
+        assert_eq!(body["authorization"], "Bearer profile-api-key");
+        assert_eq!(body["account_id"], "missing");
     }
 
     #[tokio::test]
