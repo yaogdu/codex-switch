@@ -592,6 +592,10 @@ select:focus-visible {
   width: 126px;
 }
 
+.profile-filter-select {
+  width: 140px;
+}
+
 .select-box select {
   appearance: none;
   cursor: pointer;

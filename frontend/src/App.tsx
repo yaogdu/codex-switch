@@ -38,6 +38,7 @@ type BindingMode = "global" | "fixed";
 type RefreshMinutes = 0 | 1 | 2 | 3 | 5 | 10 | 15;
 type ThemeMode = "system" | "light" | "dark";
 type SessionFilter = "today" | "all";
+type SessionProfileFilter = "all" | "global" | `profile:${string}`;
 
 const refreshOptions: RefreshMinutes[] = [1, 2, 3, 5, 10, 15];
 
@@ -118,6 +119,8 @@ function App() {
   const [dashboard, setDashboard] = useState<Dashboard>(sampleDashboard);
   const [query, setQuery] = useState("");
   const [sessionFilter, setSessionFilter] = useState<SessionFilter>("today");
+  const [profileFilter, setProfileFilter] =
+    useState<SessionProfileFilter>("all");
   const [sort, setSort] = useState<
     "last_active_at" | "created_at" | "size_bytes"
   >(
@@ -238,6 +241,9 @@ function App() {
     const normalized = query.trim().toLowerCase();
     return [...dashboard.sessions]
       .filter((session) => {
+        if (!matchesSessionProfile(session, profileFilter)) {
+          return false;
+        }
         if (sessionFilter === "today" && !isToday(session.last_active_at)) {
           return false;
         }
@@ -248,7 +254,7 @@ function App() {
           .includes(normalized);
       })
       .sort((a, b) => sortSessions(a, b, sort));
-  }, [dashboard.sessions, query, sessionFilter, sort]);
+  }, [dashboard.sessions, profileFilter, query, sessionFilter, sort]);
   const todaySessionCount = useMemo(
     () =>
       dashboard.sessions.filter((session) => isToday(session.last_active_at))
@@ -266,7 +272,18 @@ function App() {
 
   useEffect(() => {
     setSessionPage(1);
-  }, [query, sessionFilter, sort]);
+  }, [profileFilter, query, sessionFilter, sort]);
+
+  useEffect(() => {
+    if (
+      profileFilter.startsWith("profile:") &&
+      !dashboard.profiles.some(
+        (profile) => `profile:${profile.id}` === profileFilter,
+      )
+    ) {
+      setProfileFilter("all");
+    }
+  }, [dashboard.profiles, profileFilter]);
 
   useEffect(() => {
     if (sessionPage > totalSessionPages) {
@@ -610,7 +627,7 @@ function App() {
                       placeholder="搜索 ID、标题或目录"
                     />
                   </label>
-                  <label className="select-box filter-select">
+                  <label className="select-box filter-select" title="按时间筛选">
                     <CalendarDays size={14} />
                     <select
                       value={sessionFilter}
@@ -620,6 +637,31 @@ function App() {
                     >
                       <option value="today">今天活跃</option>
                       <option value="all">全部 Session</option>
+                    </select>
+                  </label>
+                  <label
+                    className="select-box profile-filter-select"
+                    title="按配置档筛选"
+                  >
+                    <SlidersHorizontal size={14} />
+                    <select
+                      value={profileFilter}
+                      onChange={(event) =>
+                        setProfileFilter(
+                          event.target.value as SessionProfileFilter,
+                        )
+                      }
+                    >
+                      <option value="all">所有配置档</option>
+                      <option value="global">跟随全局</option>
+                      {dashboard.profiles.map((profile) => (
+                        <option
+                          key={profile.id}
+                          value={`profile:${profile.id}`}
+                        >
+                          固定：{profile.id}
+                        </option>
+                      ))}
                     </select>
                   </label>
                   <label className="select-box">
@@ -703,6 +745,7 @@ function App() {
                   <EmptySessions
                     query={query}
                     sessionFilter={sessionFilter}
+                    profileFilter={profileFilter}
                     onRefresh={() => void refresh()}
                   />
                 )}
@@ -899,6 +942,15 @@ function SessionRow({
   );
 }
 
+function matchesSessionProfile(
+  session: Session,
+  profileFilter: SessionProfileFilter,
+) {
+  if (profileFilter === "all") return true;
+  if (profileFilter === "global") return session.profile_id === null;
+  return session.profile_id === profileFilter.slice("profile:".length);
+}
+
 function ProfileRow({
   profile,
   onEdit,
@@ -1038,13 +1090,16 @@ function ProfileDialog({
 function EmptySessions({
   query,
   sessionFilter,
+  profileFilter,
   onRefresh,
 }: {
   query: string;
   sessionFilter: SessionFilter;
+  profileFilter: SessionProfileFilter;
   onRefresh: () => void;
 }) {
   const isTodayFilter = sessionFilter === "today";
+  const hasProfileFilter = profileFilter !== "all";
   return (
     <div className="empty-state">
       <div className="empty-icon">
@@ -1053,6 +1108,8 @@ function EmptySessions({
       <strong>
         {query
           ? "没有匹配的 Session"
+          : hasProfileFilter
+            ? "没有匹配的 Session"
           : isTodayFilter
             ? "今天还没有活跃 Session"
             : "还没有扫描到 Session"}
@@ -1060,6 +1117,8 @@ function EmptySessions({
       <span>
         {query
           ? "换一个关键词试试。"
+          : hasProfileFilter
+            ? "换一个配置档或清除筛选。"
           : isTodayFilter
             ? "切到全部 Session 查看历史记录。"
           : "确认本机存在 ~/.codex/sessions 后重新扫描。"}
