@@ -36,6 +36,8 @@ pub struct Config {
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub bindings: BTreeMap<String, Binding>,
+    #[serde(default)]
+    pub session_tags: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -481,6 +483,7 @@ mod tests {
                     },
                 ),
             ]),
+            session_tags: BTreeMap::new(),
         }
     }
 
@@ -529,6 +532,23 @@ mod tests {
                 SessionIdSource::TurnMetadataThreadId
             )
         );
+    }
+
+    #[test]
+    fn config_without_session_tags_defaults_to_empty() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "listen": "127.0.0.1:8787",
+                "default_profile": "sakura",
+                "profiles": {
+                    "sakura": {
+                        "base_url": "https://api.example.com/v1"
+                    }
+                }
+            }"#,
+        )
+        .expect("legacy config should deserialize");
+        assert!(config.session_tags.is_empty());
     }
 
     #[tokio::test]
@@ -638,6 +658,7 @@ mod tests {
                 },
             )]),
             bindings: BTreeMap::new(),
+            session_tags: BTreeMap::new(),
         };
         let state = ProxyState::new(config).expect("valid test config");
         let proxy = TestServer::start(app(state)).await;
@@ -671,6 +692,7 @@ mod tests {
                 },
             )]),
             bindings: BTreeMap::new(),
+            session_tags: BTreeMap::new(),
         };
         let state = ProxyState::new(config).expect("valid test config");
         let proxy = TestServer::start(app(state)).await;

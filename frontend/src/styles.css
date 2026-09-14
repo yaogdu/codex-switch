@@ -537,10 +537,21 @@ select:focus-visible {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 14px;
   min-height: 62px;
   padding: 12px 14px 11px 16px;
   border-bottom: 1px solid var(--line-soft);
   background: var(--surface);
+}
+
+.sessions-toolbar .toolbar-title {
+  min-width: 150px;
+  flex: 0 0 180px;
+}
+
+.sessions-toolbar .toolbar-controls {
+  min-width: 0;
+  flex: 1;
 }
 
 .toolbar-title h2 {
@@ -574,9 +585,16 @@ select:focus-visible {
   width: 220px;
 }
 
+.sessions-toolbar .search-box {
+  width: auto;
+  min-width: 180px;
+  flex: 1 1 200px;
+}
+
 .search-box input,
 .select-box select {
   width: 100%;
+  min-width: 0;
   border: 0;
   outline: 0;
   color: var(--ink-soft);
@@ -631,6 +649,7 @@ select:focus-visible {
 }
 
 .refresh-select select {
+  min-width: 0;
   border: 0;
   outline: 0;
   color: var(--ink-soft);
@@ -708,11 +727,69 @@ select:focus-visible {
   white-space: nowrap;
 }
 
-.session-primary strong {
+.session-title-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.session-title-row strong {
+  min-width: 0;
+  flex: 1;
   max-width: 285px;
   color: var(--ink);
   font-size: 12px;
   font-weight: 700;
+}
+
+.session-tag-button {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--muted);
+  background: transparent;
+}
+
+.session-tag-button:hover {
+  border-color: var(--line-strong);
+  color: var(--teal-dark);
+  background: var(--teal-pale);
+}
+
+.session-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-width: 285px;
+  margin-top: 4px;
+  overflow: hidden;
+}
+
+.session-tag,
+.session-tag-more {
+  display: inline-flex;
+  align-items: center;
+  max-width: 118px;
+  overflow: hidden;
+  padding: 2px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  color: var(--teal-dark);
+  background: var(--teal-pale);
+  font-size: 9px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-tag-more {
+  color: var(--muted);
+  background: var(--surface-muted);
 }
 
 .session-id-cell {
@@ -992,6 +1069,16 @@ select:focus-visible {
   font-weight: 690;
 }
 
+.modal-subtitle {
+  max-width: 330px;
+  margin: 6px 0 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .field {
   display: grid;
   gap: 7px;
@@ -1024,6 +1111,56 @@ select:focus-visible {
   color: var(--muted);
   font-size: 10px;
   line-height: 1.6;
+}
+
+.session-tags-modal {
+  width: min(480px, 100%);
+}
+
+.session-tag-editor {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 7px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--field-bg);
+}
+
+.session-tag-editor input {
+  min-width: 150px;
+  height: 28px;
+  flex: 1 1 150px;
+  border: 0;
+  outline: 0;
+  color: var(--ink);
+  background: transparent;
+  font-size: 11px;
+}
+
+.editor-tag {
+  gap: 4px;
+  max-width: 180px;
+}
+
+.editor-tag button {
+  display: grid;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  color: var(--muted);
+  background: transparent;
+}
+
+.editor-tag button:hover {
+  color: var(--red);
+  background: var(--danger-bg);
 }
 
 .modal-actions {
@@ -1062,6 +1199,35 @@ select:focus-visible {
 
   .search-box {
     width: 180px;
+  }
+}
+
+@media (max-width: 1280px) {
+  .sessions-toolbar {
+    display: grid;
+    grid-template-columns: 1fr;
+    align-items: start;
+    gap: 10px;
+  }
+
+  .sessions-toolbar .toolbar-title {
+    width: 100%;
+    flex: none;
+  }
+
+  .sessions-toolbar .toolbar-controls {
+    display: grid;
+    grid-template-columns: minmax(150px, 1fr) 108px 120px 105px 31px 106px;
+    width: 100%;
+    flex: none;
+    justify-content: stretch;
+  }
+
+  .sessions-toolbar .search-box,
+  .sessions-toolbar .select-box,
+  .sessions-toolbar .refresh-select {
+    width: auto;
+    min-width: 0;
   }
 }
 

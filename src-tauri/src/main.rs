@@ -24,6 +24,8 @@ use tauri::{
 use tokio::task::JoinHandle;
 
 const CODEX_CONFIG_BACKUP_PREFIX: &str = "config.toml.codex-switch-backup";
+const MAX_SESSION_TAGS: usize = 20;
+const MAX_SESSION_TAG_LENGTH: usize = 40;
 
 struct RuntimeState {
     config_path: PathBuf,
@@ -67,6 +69,7 @@ struct SessionSummary {
     size_bytes: u64,
     binding_mode: String,
     profile_id: Option<String>,
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -244,6 +247,7 @@ fn main() {
             delete_profile,
             set_default_profile,
             set_session_binding,
+            set_session_tags,
             import_existing_profiles,
         ])
         .build(tauri::generate_context!())
@@ -275,6 +279,7 @@ async fn get_dashboard(state: State<'_, RuntimeState>) -> Result<Dashboard, Stri
         .ok()
         .is_some_and(|root| codex_takeover_enabled(&root));
     let bindings = config.bindings.clone();
+    let session_tags = config.session_tags.clone();
     let sessions = tokio::task::spawn_blocking(scan_codex_sessions)
         .await
         .map_err(|error| format!("scan sessions: {error}"))?;
@@ -303,6 +308,7 @@ async fn get_dashboard(state: State<'_, RuntimeState>) -> Result<Dashboard, Stri
                 Some(_) => ("global".to_string(), None),
                 None => ("unbound".to_string(), None),
             };
+            let tags = session_tags.get(&session.id).cloned().unwrap_or_default();
             SessionSummary {
                 id: session.id,
                 title: session.title,
@@ -312,6 +318,7 @@ async fn get_dashboard(state: State<'_, RuntimeState>) -> Result<Dashboard, Stri
                 size_bytes: session.size_bytes,
                 binding_mode,
                 profile_id,
+                tags,
             }
         })
         .collect();
@@ -583,6 +590,27 @@ async fn set_session_binding(
                 profile: None,
             },
         );
+    }
+    config.validate()?;
+    persist_config(&state, &config).await
+}
+
+#[tauri::command]
+async fn set_session_tags(
+    state: State<'_, RuntimeState>,
+    session_id: String,
+    tags: Vec<String>,
+) -> Result<(), String> {
+    let session_id = session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Err("Session ID 不能为空".to_string());
+    }
+    let tags = normalize_session_tags(tags)?;
+    let mut config = read_config(&state.config_path)?;
+    if tags.is_empty() {
+        config.session_tags.remove(&session_id);
+    } else {
+        config.session_tags.insert(session_id, tags);
     }
     config.validate()?;
     persist_config(&state, &config).await
@@ -980,6 +1008,7 @@ fn ensure_config(path: &Path) -> Result<(), String> {
             },
         )]),
         bindings: BTreeMap::new(),
+        session_tags: BTreeMap::new(),
     };
     write_config(path, &config)
 }
@@ -988,6 +1017,30 @@ fn read_config(path: &Path) -> Result<Config, String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("read config {}: {error}", path.display()))?;
     serde_json::from_str(&text).map_err(|error| format!("parse config {}: {error}", path.display()))
+}
+
+fn normalize_session_tags(tags: Vec<String>) -> Result<Vec<String>, String> {
+    if tags.len() > MAX_SESSION_TAGS {
+        return Err(format!("每个 Session 最多设置 {MAX_SESSION_TAGS} 个标签"));
+    }
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = tag.split_whitespace().collect::<Vec<_>>().join(" ");
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.chars().count() > MAX_SESSION_TAG_LENGTH {
+            return Err(format!("单个标签不能超过 {MAX_SESSION_TAG_LENGTH} 个字符"));
+        }
+        if normalized
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(&tag))
+        {
+            continue;
+        }
+        normalized.push(tag);
+    }
+    Ok(normalized)
 }
 
 fn write_config(path: &Path, config: &Config) -> Result<(), String> {
@@ -1393,5 +1446,19 @@ mod tests {
         })));
         assert!(json_is_subagent_source(&serde_json::json!("subagent")));
         assert!(!json_is_subagent_source(&serde_json::json!("cli")));
+    }
+
+    #[test]
+    fn session_tags_are_normalized_for_storage() {
+        assert_eq!(
+            normalize_session_tags(vec![
+                "  her  ".to_string(),
+                "HER".to_string(),
+                "待   复盘".to_string(),
+                String::new(),
+            ])
+            .unwrap(),
+            vec!["her".to_string(), "待 复盘".to_string()]
+        );
     }
 }

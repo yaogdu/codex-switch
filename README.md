@@ -1,7 +1,7 @@
 # Codex Switch
 
 ![macOS](https://img.shields.io/badge/macOS-desktop-111827)
-![Version 0.1.4](https://img.shields.io/badge/Version-0.1.4-111827)
+![Version 0.1.5](https://img.shields.io/badge/Version-0.1.5-111827)
 ![Tauri 2](https://img.shields.io/badge/Tauri-2.x-24C8DB)
 ![React](https://img.shields.io/badge/React-18-61DAFB)
 ![Rust](https://img.shields.io/badge/Rust-1.85%2B-b45309)

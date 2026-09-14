@@ -27,6 +27,7 @@ import {
   Settings2,
   SlidersHorizontal,
   Sun,
+  Tags,
   Trash2,
   X,
 } from "lucide-react";
@@ -72,6 +73,7 @@ type Session = {
   size_bytes: number;
   binding_mode: BindingMode | "unbound";
   profile_id: string | null;
+  tags: string[];
 };
 
 type Dashboard = {
@@ -88,6 +90,8 @@ type ProfileForm = {
   base_url: string;
   api_key: string;
 };
+
+type SessionTagsForm = Pick<Session, "id" | "title" | "tags">;
 
 const sampleDashboard: Dashboard = {
   proxy_running: false,
@@ -137,6 +141,8 @@ function App() {
   const [editingProfile, setEditingProfile] = useState<ProfileForm | null>(
     null,
   );
+  const [editingSessionTags, setEditingSessionTags] =
+    useState<SessionTagsForm | null>(null);
   const refreshRequest = useRef(0);
 
   const refresh = useCallback(async (silent = false) => {
@@ -248,7 +254,12 @@ function App() {
           return false;
         }
         if (!normalized) return true;
-        return [session.id, session.title, session.project_dir]
+        return [
+          session.id,
+          session.title,
+          session.project_dir,
+          ...session.tags,
+        ]
           .join(" ")
           .toLowerCase()
           .includes(normalized);
@@ -440,6 +451,32 @@ function App() {
     }
   };
 
+  const saveSessionTags = async (sessionId: string, tags: string[]) => {
+    const normalizedTags = normalizeSessionTags(tags);
+    setBusy(true);
+    try {
+      await command("set_session_tags", {
+        sessionId,
+        tags: normalizedTags,
+      });
+      setDashboard((current) => ({
+        ...current,
+        sessions: current.sessions.map((session) =>
+          session.id === sessionId
+            ? { ...session, tags: normalizedTags }
+            : session,
+        ),
+      }));
+      setEditingSessionTags(null);
+      void refresh(true);
+      setNotice("标签已保存");
+    } catch (error) {
+      setNotice(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -609,8 +646,8 @@ function App() {
           </div>
 
           {page === "sessions" ? (
-            <section className="workspace">
-              <div className="workspace-toolbar">
+            <section className="workspace sessions-workspace">
+              <div className="workspace-toolbar sessions-toolbar">
                 <div className="toolbar-title">
                   <h2>Session 路由</h2>
                   <span>只管理元数据，不读取对话内容</span>
@@ -737,6 +774,13 @@ function App() {
                         session={session}
                         profiles={dashboard.profiles}
                         onBinding={setBinding}
+                        onEditTags={() =>
+                          setEditingSessionTags({
+                            id: session.id,
+                            title: session.title,
+                            tags: session.tags,
+                          })
+                        }
                       />
                     ))}
                   </tbody>
@@ -827,6 +871,17 @@ function App() {
           onSave={(form) => void saveProfile(form)}
         />
       )}
+
+      {editingSessionTags && (
+        <SessionTagsDialog
+          session={editingSessionTags}
+          busy={busy}
+          onClose={() => setEditingSessionTags(null)}
+          onSave={(tags) =>
+            void saveSessionTags(editingSessionTags.id, tags)
+          }
+        />
+      )}
     </div>
   );
 }
@@ -860,6 +915,7 @@ function SessionRow({
   session,
   profiles,
   onBinding,
+  onEditTags,
 }: {
   session: Session;
   profiles: Profile[];
@@ -868,6 +924,7 @@ function SessionRow({
     mode: BindingMode,
     profileId?: string,
   ) => Promise<void>;
+  onEditTags: () => void;
 }) {
   const [mode, setMode] = useState<BindingMode>(
     session.binding_mode === "fixed" ? "fixed" : "global",
@@ -897,7 +954,34 @@ function SessionRow({
     <tr>
       <td>
         <div className="session-primary">
-          <strong title={session.title}>{session.title || "未命名 Session"}</strong>
+          <div className="session-title-row">
+            <strong title={session.title}>
+              {session.title || "未命名 Session"}
+            </strong>
+            <button
+              type="button"
+              className="session-tag-button"
+              title="编辑标签"
+              aria-label="编辑 Session 标签"
+              onClick={onEditTags}
+            >
+              <Tags size={13} />
+            </button>
+          </div>
+          {session.tags.length > 0 && (
+            <div className="session-tags">
+              {session.tags.slice(0, 4).map((tag) => (
+                <span className="session-tag" key={tag} title={tag}>
+                  {tag}
+                </span>
+              ))}
+              {session.tags.length > 4 && (
+                <span className="session-tag-more">
+                  +{session.tags.length - 4}
+                </span>
+              )}
+            </div>
+          )}
         </div>
       </td>
       <td>
@@ -949,6 +1033,23 @@ function matchesSessionProfile(
   if (profileFilter === "all") return true;
   if (profileFilter === "global") return session.profile_id === null;
   return session.profile_id === profileFilter.slice("profile:".length);
+}
+
+function normalizeSessionTags(tags: string[]) {
+  const normalized: string[] = [];
+  for (const rawTag of tags) {
+    const tag = rawTag.trim().replace(/\s+/g, " ");
+    if (
+      !tag ||
+      normalized.some(
+        (existing) => existing.toLowerCase() === tag.toLowerCase(),
+      )
+    ) {
+      continue;
+    }
+    normalized.push(tag);
+  }
+  return normalized;
 }
 
 function ProfileRow({
@@ -1080,6 +1181,108 @@ function ProfileDialog({
           <button type="submit" className="button button-primary" disabled={busy}>
             {busy && <LoaderCircle className="spin" size={15} />}
             保存配置档
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function SessionTagsDialog({
+  session,
+  busy,
+  onClose,
+  onSave,
+}: {
+  session: SessionTagsForm;
+  busy: boolean;
+  onClose: () => void;
+  onSave: (tags: string[]) => void;
+}) {
+  const [tags, setTags] = useState(() => normalizeSessionTags(session.tags));
+  const [draft, setDraft] = useState("");
+
+  const addTag = (value: string) => {
+    const nextTags = normalizeSessionTags([...tags, value]);
+    if (nextTags.length !== tags.length || value.trim()) {
+      setTags(nextTags);
+    }
+    setDraft("");
+  };
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    onSave(normalizeSessionTags([...tags, draft]));
+  };
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <form
+        className="modal session-tags-modal"
+        onSubmit={submit}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="modal-header">
+          <div>
+            <span className="eyebrow">SESSION TAGS</span>
+            <h2>编辑标签</h2>
+            <p className="modal-subtitle" title={session.title}>
+              {session.title || "未命名 Session"}
+            </p>
+          </div>
+          <button
+            type="button"
+            className="icon-button"
+            title="关闭"
+            onClick={onClose}
+          >
+            <X size={17} />
+          </button>
+        </div>
+
+        <div className="session-tag-editor">
+          {tags.map((tag, index) => (
+            <span className="session-tag editor-tag" key={tag}>
+              {tag}
+              <button
+                type="button"
+                title={`移除标签 ${tag}`}
+                aria-label={`移除标签 ${tag}`}
+                onClick={() =>
+                  setTags(tags.filter((_, tagIndex) => tagIndex !== index))
+                }
+              >
+                <X size={11} />
+              </button>
+            </span>
+          ))}
+          <input
+            autoFocus
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (["Enter", ",", "，"].includes(event.key)) {
+                event.preventDefault();
+                addTag(draft);
+              }
+            }}
+            placeholder="输入标签后按 Enter 添加"
+          />
+        </div>
+        <p className="field-note">
+          标签仅保存在 Codex Switch 中，不会修改 Codex 的 Session。
+        </p>
+        <div className="modal-actions">
+          <button
+            type="button"
+            className="button button-quiet"
+            onClick={onClose}
+          >
+            取消
+          </button>
+          <button type="submit" className="button button-primary" disabled={busy}>
+            {busy && <LoaderCircle className="spin" size={15} />}
+            保存标签
           </button>
         </div>
       </form>
