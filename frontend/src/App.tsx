@@ -17,6 +17,7 @@ import {
   LoaderCircle,
   Monitor,
   Moon,
+  Network,
   Pencil,
   Plus,
   Power,
@@ -79,6 +80,7 @@ type Session = {
 type Dashboard = {
   proxy_running: boolean;
   listen: string | null;
+  outbound_proxy: string | null;
   codex_proxy_enabled: boolean;
   default_profile: string;
   profiles: Profile[];
@@ -96,6 +98,7 @@ type SessionTagsForm = Pick<Session, "id" | "title" | "tags">;
 const sampleDashboard: Dashboard = {
   proxy_running: false,
   listen: null,
+  outbound_proxy: null,
   codex_proxy_enabled: false,
   default_profile: "sakura",
   profiles: [
@@ -143,6 +146,7 @@ function App() {
   );
   const [editingSessionTags, setEditingSessionTags] =
     useState<SessionTagsForm | null>(null);
+  const [outboundProxyDraft, setOutboundProxyDraft] = useState("");
   const refreshRequest = useRef(0);
 
   const refresh = useCallback(async (silent = false) => {
@@ -177,6 +181,10 @@ function App() {
     document.documentElement.dataset.theme = themeMode;
     localStorage.setItem("codex-switch.theme", themeMode);
   }, [themeMode]);
+
+  useEffect(() => {
+    setOutboundProxyDraft(dashboard.outbound_proxy ?? "");
+  }, [dashboard.outbound_proxy]);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -427,6 +435,27 @@ function App() {
       }));
       void refresh(true);
       setNotice(`默认配置档已切换为 ${profileId}`);
+    } catch (error) {
+      setNotice(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveOutboundProxy = async (event: FormEvent) => {
+    event.preventDefault();
+    const outboundProxy = outboundProxyDraft.trim();
+    setBusy(true);
+    try {
+      await command("set_outbound_proxy", {
+        outboundProxy: outboundProxy || null,
+      });
+      setDashboard((current) => ({
+        ...current,
+        outbound_proxy: outboundProxy || null,
+      }));
+      void refresh(true);
+      setNotice(outboundProxy ? "出站代理已保存" : "出站代理已清空");
     } catch (error) {
       setNotice(String(error));
     } finally {
@@ -832,6 +861,47 @@ function App() {
                 </div>
               </div>
               <div className="profile-list">
+                <form
+                  className="profile-row outbound-proxy-row"
+                  onSubmit={(event) => void saveOutboundProxy(event)}
+                >
+                  <div className="profile-symbol">
+                    <Network size={16} />
+                  </div>
+                  <div className="profile-main">
+                    <div className="profile-name">
+                      <strong>出站代理</strong>
+                      <span
+                        className={
+                          dashboard.outbound_proxy
+                            ? "auth-badge ready"
+                            : "auth-badge"
+                        }
+                      >
+                        {dashboard.outbound_proxy ? "已配置" : "未配置"}
+                      </span>
+                    </div>
+                    <span title={dashboard.outbound_proxy ?? ""}>
+                      {dashboard.outbound_proxy ?? "直接连接上游"}
+                    </span>
+                  </div>
+                  <label className="outbound-proxy-input">
+                    <input
+                      value={outboundProxyDraft}
+                      onChange={(event) =>
+                        setOutboundProxyDraft(event.target.value)
+                      }
+                      placeholder="http://127.0.0.1:7897"
+                    />
+                  </label>
+                  <button
+                    type="submit"
+                    className="button button-quiet"
+                    disabled={busy}
+                  >
+                    保存
+                  </button>
+                </form>
                 {dashboard.profiles.map((profile) => (
                   <ProfileRow
                     key={profile.id}

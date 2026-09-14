@@ -902,6 +902,36 @@ select:focus-visible {
   display: grid;
 }
 
+.outbound-proxy-row {
+  flex-wrap: wrap;
+  background: var(--surface-soft);
+}
+
+.outbound-proxy-row .profile-main {
+  flex: 1 1 220px;
+}
+
+.outbound-proxy-input {
+  display: flex;
+  height: 31px;
+  flex: 0 1 280px;
+  min-width: 190px;
+  padding: 0 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--field-bg);
+}
+
+.outbound-proxy-input input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  color: var(--ink);
+  background: transparent;
+  font-size: 11px;
+}
+
 .profile-row {
   display: flex;
   align-items: center;

@@ -7,7 +7,7 @@ use axum::{
     Router,
 };
 use futures::TryStreamExt;
-use reqwest::Client;
+use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, net::SocketAddr, path::Path, sync::Arc};
@@ -32,6 +32,8 @@ const PROFILE_AUTH_HEADERS: [&str; 4] = [
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub listen: String,
+    #[serde(default)]
+    pub outbound_proxy: Option<String>,
     pub default_profile: String,
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
@@ -64,7 +66,7 @@ pub enum BindingMode {
 #[derive(Debug, Clone)]
 pub struct ProxyState {
     config: Arc<RwLock<Config>>,
-    client: Client,
+    client: Arc<RwLock<Client>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -89,6 +91,9 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         if self.listen.trim().is_empty() {
             return Err("listen must not be empty".to_string());
+        }
+        if let Some(proxy_url) = outbound_proxy_url(self) {
+            Proxy::all(proxy_url).map_err(|error| format!("outbound_proxy is invalid: {error}"))?;
         }
         if !self.profiles.contains_key(&self.default_profile) {
             return Err(format!(
@@ -145,18 +150,18 @@ impl Config {
 impl ProxyState {
     pub fn new(config: Config) -> Result<Self, String> {
         config.validate()?;
-        let client = Client::builder()
-            .build()
-            .map_err(|error| format!("build HTTP client: {error}"))?;
+        let client = build_http_client(&config)?;
         Ok(Self {
             config: Arc::new(RwLock::new(config)),
-            client,
+            client: Arc::new(RwLock::new(client)),
         })
     }
 
     pub async fn replace_config(&self, config: Config) -> Result<(), String> {
         config.validate()?;
+        let client = build_http_client(&config)?;
         *self.config.write().await = config;
+        *self.client.write().await = client;
         Ok(())
     }
 
@@ -183,6 +188,26 @@ impl ProxyState {
             profile.clone(),
         ))
     }
+}
+
+fn outbound_proxy_url(config: &Config) -> Option<&str> {
+    config
+        .outbound_proxy
+        .as_deref()
+        .map(str::trim)
+        .filter(|proxy_url| !proxy_url.is_empty())
+}
+
+fn build_http_client(config: &Config) -> Result<Client, String> {
+    let mut builder = Client::builder();
+    if let Some(proxy_url) = outbound_proxy_url(config) {
+        builder = builder.proxy(
+            Proxy::all(proxy_url).map_err(|error| format!("outbound_proxy is invalid: {error}"))?,
+        );
+    }
+    builder
+        .build()
+        .map_err(|error| format!("build HTTP client: {error}"))
 }
 
 fn profile_uses_client_auth(profile: &Profile) -> bool {
@@ -268,8 +293,8 @@ async fn proxy(State(state): State<ProxyState>, request: axum::extract::Request)
         upstream_headers.insert(name, value);
     }
 
-    let upstream_response = state
-        .client
+    let client = state.client.read().await.clone();
+    let upstream_response = client
         .request(request_method, &upstream_url)
         .headers(upstream_headers)
         .body(reqwest::Body::wrap_stream(body.into_data_stream().map_err(
@@ -458,6 +483,7 @@ mod tests {
             .collect();
         Config {
             listen: "127.0.0.1:0".to_string(),
+            outbound_proxy: None,
             default_profile: "sakura".to_string(),
             profiles,
             bindings: BTreeMap::from([
@@ -549,6 +575,75 @@ mod tests {
         )
         .expect("legacy config should deserialize");
         assert!(config.session_tags.is_empty());
+        assert_eq!(config.outbound_proxy, None);
+    }
+
+    #[tokio::test]
+    async fn replace_config_rebuilds_the_outbound_proxy_client() {
+        let direct_upstream = TestServer::start(Router::new().fallback(any(|| async {
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({"route": "direct"})),
+            )
+        })))
+        .await;
+        let outbound_proxy = TestServer::start(Router::new().fallback(any(
+            |request: Request<Body>| async move {
+                (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "route": "outbound_proxy",
+                        "uri": request.uri().to_string(),
+                    })),
+                )
+            },
+        )))
+        .await;
+
+        let mut config = Config {
+            listen: "127.0.0.1:0".to_string(),
+            outbound_proxy: None,
+            default_profile: "personal".to_string(),
+            profiles: BTreeMap::from([(
+                "personal".to_string(),
+                Profile {
+                    base_url: format!("http://{}", direct_upstream.addr),
+                    headers: BTreeMap::new(),
+                },
+            )]),
+            bindings: BTreeMap::new(),
+            session_tags: BTreeMap::new(),
+        };
+        let state = ProxyState::new(config.clone()).expect("valid test config");
+        let proxy = TestServer::start(app(state.clone())).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .get(format!("http://{}/models", proxy.addr))
+            .send()
+            .await
+            .expect("direct proxy request")
+            .json::<Value>()
+            .await
+            .expect("direct response");
+        assert_eq!(response["route"], "direct");
+
+        config.outbound_proxy = Some(format!("http://{}", outbound_proxy.addr));
+        state
+            .replace_config(config)
+            .await
+            .expect("replace config with outbound proxy");
+
+        let response = client
+            .get(format!("http://{}/models", proxy.addr))
+            .send()
+            .await
+            .expect("outbound proxy request")
+            .json::<Value>()
+            .await
+            .expect("outbound proxy response");
+        assert_eq!(response["route"], "outbound_proxy");
+        assert!(response["uri"].as_str().unwrap().ends_with("/models"));
     }
 
     #[tokio::test]
@@ -640,6 +735,7 @@ mod tests {
         let upstream = TestServer::start(Router::new().fallback(any(auth_echo_handler))).await;
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
+            outbound_proxy: None,
             default_profile: "personal".to_string(),
             profiles: BTreeMap::from([(
                 "personal".to_string(),
@@ -680,6 +776,7 @@ mod tests {
         let upstream = TestServer::start(Router::new().fallback(any(auth_echo_handler))).await;
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
+            outbound_proxy: None,
             default_profile: "sakura".to_string(),
             profiles: BTreeMap::from([(
                 "sakura".to_string(),

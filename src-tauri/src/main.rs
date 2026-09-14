@@ -45,6 +45,7 @@ struct ProxyHandle {
 struct Dashboard {
     proxy_running: bool,
     listen: Option<String>,
+    outbound_proxy: Option<String>,
     codex_proxy_enabled: bool,
     default_profile: String,
     profiles: Vec<ProfileSummary>,
@@ -105,7 +106,7 @@ fn main() {
                 .map_err(|error| format!("create app config directory: {error}"))?;
             let config_path = config_dir.join("config.json");
             ensure_config(&config_path)?;
-            if let Err(error) = recover_stale_codex_takeover() {
+            if let Err(error) = recover_stale_codex_takeover(&config_path) {
                 eprintln!("恢复残留 Codex 接管失败: {error}");
             }
             app.manage(RuntimeState {
@@ -193,7 +194,7 @@ fn main() {
                                 .ok()
                                 .is_some_and(|root| codex_takeover_enabled(&root));
                             let result = if takeover_enabled {
-                                restore_codex_files_from_home()
+                                restore_codex_files_from_state(&state)
                             } else {
                                 takeover_codex_impl(&state).await
                             };
@@ -248,13 +249,15 @@ fn main() {
             set_default_profile,
             set_session_binding,
             set_session_tags,
+            set_outbound_proxy,
             import_existing_profiles,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Codex Switch");
     app.run(|_app, event| {
         if let RunEvent::ExitRequested { .. } = event {
-            if let Err(error) = restore_codex_files_from_home() {
+            let state = _app.state::<RuntimeState>();
+            if let Err(error) = restore_codex_files_from_state(&state) {
                 eprintln!("退出前取消接管 Codex 配置失败: {error}");
             }
         }
@@ -326,6 +329,7 @@ async fn get_dashboard(state: State<'_, RuntimeState>) -> Result<Dashboard, Stri
     Ok(Dashboard {
         proxy_running,
         listen,
+        outbound_proxy: config.outbound_proxy,
         codex_proxy_enabled,
         default_profile: config.default_profile,
         profiles,
@@ -394,7 +398,7 @@ async fn stop_proxy_impl(state: &RuntimeState) -> Result<(), String> {
         .ok()
         .is_some_and(|root| codex_takeover_enabled(&root))
     {
-        restore_codex_files_from_home()?;
+        restore_codex_files_from_state(state)?;
     }
     let handle = state
         .proxy
@@ -428,19 +432,27 @@ async fn takeover_codex_impl(state: &RuntimeState) -> Result<(), String> {
     let text = fs::read_to_string(&config_path)
         .map_err(|error| format!("读取 Codex 配置 {}: {error}", config_path.display()))?;
     let proxy_url = format!("http://{listen}");
+    let marker_exists = marker_path.exists();
     if provider_base_url(&text, "OpenAI").as_deref() == Some(proxy_url.as_str()) {
         fs::write(&marker_path, process::id().to_string())
             .map_err(|error| format!("写入 Codex 接管状态失败: {error}"))?;
         return Ok(());
     }
-    let backup_path = next_codex_backup_path(&root);
-    fs::copy(&config_path, &backup_path)
-        .map_err(|error| format!("创建 Codex 配置备份失败: {error}"))?;
-    copy_permissions(&config_path, &backup_path)?;
+    let backup_path = if marker_exists {
+        None
+    } else {
+        let backup_path = next_codex_backup_path(&root);
+        fs::copy(&config_path, &backup_path)
+            .map_err(|error| format!("创建 Codex 配置备份失败: {error}"))?;
+        copy_permissions(&config_path, &backup_path)?;
+        Some(backup_path)
+    };
     let replaced = replace_provider_base_url(&text, "OpenAI", &proxy_url)?;
     if let Err(error) = write_text_atomic(&config_path, &replaced) {
-        if backup_path.exists() {
-            let _ = fs::remove_file(&backup_path);
+        if let Some(backup_path) = backup_path.as_ref() {
+            if backup_path.exists() {
+                let _ = fs::remove_file(backup_path);
+            }
         }
         return Err(error);
     }
@@ -450,42 +462,55 @@ async fn takeover_codex_impl(state: &RuntimeState) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn restore_codex(app: AppHandle<Wry>, _state: State<'_, RuntimeState>) -> Result<(), String> {
-    let result = restore_codex_files_from_home();
+async fn restore_codex(app: AppHandle<Wry>, state: State<'_, RuntimeState>) -> Result<(), String> {
+    let result = restore_codex_files_from_state(&state);
     notify_state_changed(&app, None);
     result
 }
 
-fn restore_codex_files_from_home() -> Result<(), String> {
-    restore_codex_files(&codex_home()?)
+fn restore_codex_files_from_state(state: &RuntimeState) -> Result<(), String> {
+    let default_base_url = default_profile_base_url(&state.config_path)?;
+    restore_codex_files(&codex_home()?, Some(&default_base_url))
 }
 
-fn restore_codex_files(root: &Path) -> Result<(), String> {
+fn restore_codex_files(root: &Path, default_base_url: Option<&str>) -> Result<(), String> {
     let config_path = root.join("config.toml");
     let marker_path = root.join("config.toml.codex-switch-session");
+    let marker_exists = marker_path.exists();
     let Some(backup_path) = latest_codex_backup_path(root) else {
-        let _ = fs::remove_file(marker_path);
         let current = fs::read_to_string(&config_path)
             .map_err(|error| format!("读取 Codex 配置 {}: {error}", config_path.display()))?;
-        if provider_base_url(&current, "OpenAI")
-            .is_some_and(|url| url.starts_with("http://127.0.0.1:"))
-        {
+        let current_uses_proxy = provider_base_url(&current, "OpenAI")
+            .is_some_and(|url| url.starts_with("http://127.0.0.1:"));
+        if marker_exists || current_uses_proxy {
+            if let Some(default_base_url) = default_base_url {
+                let restored = restore_codex_text(&current, default_base_url)?;
+                write_text_atomic(&config_path, &restored)?;
+                let _ = fs::remove_file(marker_path);
+                return Ok(());
+            }
             return Err("没有可用备份，无法取消接管".to_string());
         }
+        let _ = fs::remove_file(marker_path);
         return Ok(());
     };
     let current = fs::read_to_string(&config_path)
         .map_err(|error| format!("读取 Codex 配置 {}: {error}", config_path.display()))?;
-    if !matches!(
-        provider_base_url(&current, "OpenAI"),
-        Some(url) if url.starts_with("http://127.0.0.1:")
-    ) {
+    if !marker_exists
+        && !provider_base_url(&current, "OpenAI")
+            .is_some_and(|url| url.starts_with("http://127.0.0.1:"))
+    {
         let _ = fs::remove_file(marker_path);
         return Ok(());
     }
     let backup = fs::read_to_string(&backup_path)
         .map_err(|error| format!("读取 Codex 配置备份失败: {error}"))?;
-    write_text_atomic(&config_path, &backup)?;
+    let restored = if let Some(default_base_url) = default_base_url {
+        restore_codex_text(&backup, default_base_url)?
+    } else {
+        backup
+    };
+    write_text_atomic(&config_path, &restored)?;
     let _ = fs::remove_file(marker_path);
     Ok(())
 }
@@ -617,6 +642,20 @@ async fn set_session_tags(
 }
 
 #[tauri::command]
+async fn set_outbound_proxy(
+    state: State<'_, RuntimeState>,
+    outbound_proxy: Option<String>,
+) -> Result<(), String> {
+    let mut config = read_config(&state.config_path)?;
+    config.outbound_proxy = outbound_proxy.and_then(|proxy| {
+        let proxy = proxy.trim().to_string();
+        (!proxy.is_empty()).then_some(proxy)
+    });
+    config.validate()?;
+    persist_config(&state, &config).await
+}
+
+#[tauri::command]
 async fn import_existing_profiles(state: State<'_, RuntimeState>) -> Result<usize, String> {
     let root = codex_home()?;
     let profiles_dir = root.join("config.profiles");
@@ -695,7 +734,7 @@ fn codex_takeover_enabled(root: &Path) -> bool {
         .is_some_and(|url| url.starts_with("http://127.0.0.1:"))
 }
 
-fn recover_stale_codex_takeover() -> Result<(), String> {
+fn recover_stale_codex_takeover(config_path: &Path) -> Result<(), String> {
     let root = codex_home()?;
     let marker_path = root.join("config.toml.codex-switch-session");
     if !codex_takeover_enabled(&root) {
@@ -710,7 +749,8 @@ fn recover_stale_codex_takeover() -> Result<(), String> {
         return Ok(());
     }
 
-    restore_codex_files(&root)
+    let default_base_url = default_profile_base_url(config_path).ok();
+    restore_codex_files(&root, default_base_url.as_deref())
 }
 
 fn next_codex_backup_path(root: &Path) -> PathBuf {
@@ -836,6 +876,56 @@ fn update_tray_menu(app: &AppHandle<Wry>) {
             let _ = item.set_enabled(proxy_running || takeover_enabled);
         }
     };
+}
+
+fn default_profile_base_url(config_path: &Path) -> Result<String, String> {
+    let config = read_config(config_path)?;
+    config.validate()?;
+    config
+        .profiles
+        .get(&config.default_profile)
+        .map(|profile| profile.base_url.trim_end_matches('/').to_string())
+        .ok_or_else(|| format!("默认配置档 {:?} 不存在", config.default_profile))
+}
+
+fn restore_codex_text(text: &str, default_base_url: &str) -> Result<String, String> {
+    let text = replace_provider_base_url(text, "OpenAI", default_base_url)?;
+    Ok(replace_root_model_provider(&text, "OpenAI"))
+}
+
+fn replace_root_model_provider(text: &str, provider: &str) -> String {
+    let mut in_root = true;
+    let mut replaced = false;
+    let mut output = String::with_capacity(text.len() + provider.len());
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if in_root {
+            if let Some((key, _)) = trimmed.split_once('=') {
+                if key.trim() == "model_provider" {
+                    let indent = &line[..line.len() - line.trim_start().len()];
+                    output.push_str(indent);
+                    output.push_str("model_provider = \"");
+                    output.push_str(provider);
+                    output.push_str("\"\n");
+                    replaced = true;
+                    continue;
+                }
+            }
+        }
+        if trimmed.starts_with('[') {
+            in_root = false;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    if !text.ends_with('\n') && !output.is_empty() {
+        output.pop();
+    }
+    if replaced {
+        output
+    } else {
+        format!("model_provider = \"{provider}\"\n{output}")
+    }
 }
 
 fn provider_base_url(text: &str, provider: &str) -> Option<String> {
@@ -999,6 +1089,7 @@ fn ensure_config(path: &Path) -> Result<(), String> {
     }
     let config = Config {
         listen: "127.0.0.1:8787".to_string(),
+        outbound_proxy: None,
         default_profile: "sakura".to_string(),
         profiles: BTreeMap::from([(
             "sakura".to_string(),
@@ -1436,6 +1527,38 @@ mod tests {
                 .to_str(),
             Some("config.toml.codex-switch-backup-20260909-130001-2")
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_writes_default_profile_when_marker_exists_even_if_current_config_changed() {
+        let root =
+            std::env::temp_dir().join(format!("codex-switch-restore-marker-{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let backup =
+            "model_provider = \"unknown\"\n\n[model_providers.OpenAI]\nbase_url = \"https://bad.example.com/v1\"\n";
+        fs::write(
+            root.join(format!("{CODEX_CONFIG_BACKUP_PREFIX}-20260914-160000")),
+            backup,
+        )
+        .unwrap();
+        fs::write(
+            root.join("config.toml"),
+            "model_provider = \"unknown\"\n\n[model_providers.OpenAI]\nbase_url = \"https://unknown.example/v1\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("config.toml.codex-switch-session"), "123").unwrap();
+
+        restore_codex_files(&root, Some("https://api.default.example/v1")).unwrap();
+
+        let restored = fs::read_to_string(root.join("config.toml")).unwrap();
+        assert!(restored.contains("model_provider = \"OpenAI\""));
+        assert_eq!(
+            provider_base_url(&restored, "OpenAI").as_deref(),
+            Some("https://api.default.example/v1")
+        );
+        assert!(!root.join("config.toml.codex-switch-session").exists());
         let _ = fs::remove_dir_all(root);
     }
 

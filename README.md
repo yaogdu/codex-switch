@@ -1,7 +1,7 @@
 # Codex Switch
 
 ![macOS](https://img.shields.io/badge/macOS-desktop-111827)
-![Version 0.1.5](https://img.shields.io/badge/Version-0.1.5-111827)
+![Version 0.1.6](https://img.shields.io/badge/Version-0.1.6-111827)
 ![Tauri 2](https://img.shields.io/badge/Tauri-2.x-24C8DB)
 ![React](https://img.shields.io/badge/React-18-61DAFB)
 ![Rust](https://img.shields.io/badge/Rust-1.85%2B-b45309)
@@ -47,6 +47,7 @@ Typical cases:
 
 - Runs a local Codex-compatible HTTP proxy.
 - Manages upstream profiles with base URL and optional API key.
+- Supports an app-level outbound HTTP proxy for networks that cannot reach an upstream directly.
 - Sets one global default profile.
 - Scans local Codex session metadata with pagination, search, and sorting.
 - Binds individual sessions to a fixed profile.
@@ -87,6 +88,8 @@ Install dependencies and start the desktop app:
 npm install
 npm run dev
 ```
+
+If an upstream such as ChatGPT only works through your local network proxy, open **配置档** and set **出站代理** to a URL like `http://127.0.0.1:7897`.
 
 ## Build and package
 
